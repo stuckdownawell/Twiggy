@@ -98,6 +98,9 @@ sub _accept_prepare_handler {
     };
 }
 
+
+sub keep_alive { 1 } 
+
 sub _accept_handler {
     my ( $self, $app, $is_tcp, $listen_host_r, $listen_port_r ) = @_;
 
@@ -147,22 +150,34 @@ sub _accept_handler {
             return;
         };
 
-        local $@;
-        unless ( eval {
-            if ( my $env = $try_parse->() ) {
-                # the request data is already available, no need to parse more
-                $self->_run_app($app, $env, $sock);
-            } else {
-                # there's not yet enough data to parse the request,
-                # set up a watcher
-                $self->_create_req_parsing_watcher( $sock, $try_parse, $app );
-            };
+	my $process; $process = sub {
+		local $@;
 
-            1;
-        }) {
-            my $disconnected = ($@ =~ /^client disconnected/);
-            $self->_bad_request($sock, $disconnected);
-        }
+		my $keep_alive = AE::cv { $process->() };
+
+		unless ( eval {
+		    if ( my $env = $try_parse->() ) {
+			# the request data is already available, no need to parse more
+	
+			$env->{keep_alive} = $keep_alive
+				if $self->keep_alive($env);
+
+			$self->_run_app($app, $env, $sock, );
+		    } else {
+			# there's not yet enough data to parse the request,
+			# set up a watcher
+			$self->_create_req_parsing_watcher( $sock, $try_parse, $app, $keep_alive);
+		    };
+
+		    1;
+		}) {
+		    my $disconnected = ($@ =~ /^client disconnected/);
+		    $self->_bad_request($sock, $disconnected);
+		}
+	};
+
+	$process->();
+
     };
 }
 
@@ -197,7 +212,7 @@ sub _try_read_headers {
 }
 
 sub _create_req_parsing_watcher {
-    my ( $self, $sock, $try_parse, $app ) = @_;
+    my ( $self, $sock, $try_parse, $app, $keep_alive ) = @_;
 
     my $headers_io_watcher;
 
@@ -213,6 +228,10 @@ sub _create_req_parsing_watcher {
             if ( my $env = $try_parse->() ) {
                 undef $headers_io_watcher;
                 undef $timeout_timer;
+
+				$env->{keep_alive} = $keep_alive
+					if $self->keep_alive($env);
+
                 $self->_run_app($app, $env, $sock);
             }
         } catch {
@@ -310,10 +329,10 @@ sub _run_app {
     my $res = Plack::Util::run_app $app, $env;
 
     if ( ref $res eq 'ARRAY' ) {
-        $self->_write_psgi_response($sock, $res);
+        $self->_write_psgi_response($sock, $res, $env->{keep_alive});
     } elsif ( blessed($res) and $res->isa("AnyEvent::CondVar") ) {
         Carp::carp("Returning AnyEvent condvar is deprecated and will be removed in the next release of Twiggy. Use the streaming callback interface intstead.");
-        $res->cb(sub { $self->_write_psgi_response($sock, shift->recv) });
+        $res->cb(sub { $self->_write_psgi_response($sock, shift->recv, $env->{keep_alive}) });
     } elsif ( ref $res eq 'CODE' ) {
         my $created_writer;
 
@@ -337,7 +356,7 @@ sub _run_app {
                     return $writer;
                 } else {
                     my ( $status, $headers, $body, $post ) = @$res;
-                    my $cv = $self->_write_psgi_response($sock, [ $status, $headers, $body ]);
+                    my $cv = $self->_write_psgi_response($sock, [ $status, $headers, $body ], $env->{keep_alive});
                     $cv->cb(sub { $post->() }) if $post;
                 }
             },
@@ -353,7 +372,7 @@ sub _run_app {
 }
 
 sub _write_psgi_response {
-    my ( $self, $sock, $res ) = @_;
+    my ( $self, $sock, $res, $keep_alive) = @_;
 
     if ( ref $res eq 'ARRAY' ) {
         if ( scalar @$res == 0 ) {
@@ -364,17 +383,27 @@ sub _write_psgi_response {
 
         my ( $status, $headers, $body ) = @$res;
 
+		if($keep_alive){
+			push @{ $headers }, 'Connection','Keep-Alive','Keep-Alive','timeout=10';
+		}
+
         my $cv = AE::cv;
 
         $self->_write_headers( $sock, $status, $headers )->cb(sub {
             local $@;
             if ( eval { $_[0]->recv; 1 } ) {
                 $self->_write_body($sock, $body)->cb(sub {
-                    shutdown $sock, 1;
-                    close $sock;
-                    $self->{exit_guard}->end;
-                    local $@;
-                    eval { $cv->send($_[0]->recv); 1 } or $cv->croak($@);
+					local $@;
+                	eval { $cv->send($_[0]->recv); 1 };
+
+					if($keep_alive && !$@){
+						$keep_alive->send(1);
+					}else {
+	                    shutdown $sock, 1;
+    	                close $sock;
+        	            $self->{exit_guard}->end;
+						$cv->croak($@);
+					}
                 });
             } else {
                 $self->{exit_guard}->end;
