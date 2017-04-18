@@ -19,6 +19,9 @@ use HTTP::Status;
 use Plack::HTTPParser qw(parse_http_request);
 use Plack::Util;
 
+use Time::HiRes qw/time/;
+use Data::Dumper;
+
 use constant DEBUG => $ENV{TWIGGY_DEBUG};
 use constant HAS_AIO => !$ENV{PLACK_NO_SENDFILE} && try {
     require AnyEvent::AIO;
@@ -99,7 +102,19 @@ sub _accept_prepare_handler {
 }
 
 
-sub keep_alive { 1 } 
+sub keep_alive {
+	my ($self, $env, $key) = @_;
+
+	delete $self->{keepalive}->{$key};
+
+	return 0
+		unless $env->{HTTP_CONNECTION} eq 'keep-alive';
+
+	return 0
+		if scalar(keys %{ $self->{keepalive} }) > 50; #Allow 50 keep alive connections
+
+	1;
+}
 
 sub _accept_handler {
     my ( $self, $app, $is_tcp, $listen_host_r, $listen_port_r ) = @_;
@@ -116,6 +131,7 @@ sub _accept_handler {
                 or die "setsockopt(TCP_NODELAY) failed:$!";
         }
 
+	my $last = time;
         my $headers = "";
         my $try_parse = sub {
             if ( $self->_try_read_headers($sock, $headers) ) {
@@ -150,30 +166,56 @@ sub _accept_handler {
             return;
         };
 
+	my $key = join ':',$peer_host,$peer_port;
+
 	my $process; $process = sub {
 		local $@;
 
-		my $keep_alive = AE::cv { $process->() };
+		my $keep_alive = AE::cv {
+			my $ka = eval { shift->recv };
+
+			$headers = "";
+
+			unless($ka){
+				delete $self->{keepalive}->{$key};
+				$process = undef;
+				return;
+			}
+			$self->{keepalive}->{$key} = AnyEvent->timer(after => 60, cb => sub {
+				delete $self->{keepalive}->{$key};
+
+				#Timed out so close connection
+				shutdown $sock, 1;
+				close $sock;
+				$self->{exit_guard}->end;
+			});
+			$process->();
+		};
 
 		unless ( eval {
 		    if ( my $env = $try_parse->() ) {
 			# the request data is already available, no need to parse more
-	
-			$env->{keep_alive} = $keep_alive
-				if $self->keep_alive($env);
+			if($self->keep_alive($env,$key)){
+				$env->{keep_alive} = $keep_alive;
+			}else{
+				$process = undef;
+			}
 
 			$self->_run_app($app, $env, $sock, );
 		    } else {
 			# there's not yet enough data to parse the request,
 			# set up a watcher
-			$self->_create_req_parsing_watcher( $sock, $try_parse, $app, $keep_alive);
+			$self->_create_req_parsing_watcher( $sock, $try_parse, $app, $keep_alive, $key);
 		    };
 
 		    1;
 		}) {
 		    my $disconnected = ($@ =~ /^client disconnected/);
 		    $self->_bad_request($sock, $disconnected);
+			$keep_alive->send(0);
 		}
+
+		$keep_alive = undef;
 	};
 
 	$process->();
@@ -192,7 +234,6 @@ sub _try_read_headers {
     read_more: for my $headers ( $_[2] ) {
         if ( defined(my $line = <$sock>) ) {
             $headers .= $line;
-
             if ( $line eq "\015\012" or $line eq "\012" ) {
                 # got an empty line, we're done reading the headers
                 return 1;
@@ -212,7 +253,7 @@ sub _try_read_headers {
 }
 
 sub _create_req_parsing_watcher {
-    my ( $self, $sock, $try_parse, $app, $keep_alive ) = @_;
+    my ( $self, $sock, $try_parse, $app, $keep_alive, $key ) = @_;
 
     my $headers_io_watcher;
 
@@ -229,8 +270,11 @@ sub _create_req_parsing_watcher {
                 undef $headers_io_watcher;
                 undef $timeout_timer;
 
-				$env->{keep_alive} = $keep_alive
-					if $self->keep_alive($env);
+				if($self->keep_alive($env, $key)){
+					$env->{keep_alive} = $keep_alive
+				}else{
+					$keep_alive->send(0);
+				}
 
                 $self->_run_app($app, $env, $sock);
             }
@@ -384,7 +428,7 @@ sub _write_psgi_response {
         my ( $status, $headers, $body ) = @$res;
 
 		if($keep_alive){
-			push @{ $headers }, 'Connection','Keep-Alive','Keep-Alive','timeout=10';
+			push @{ $headers }, 'Connection','keep-alive','Keep-Alive','max=50, timeout=120';
 		}
 
         my $cv = AE::cv;
@@ -395,13 +439,13 @@ sub _write_psgi_response {
                 $self->_write_body($sock, $body)->cb(sub {
 					local $@;
                 	eval { $cv->send($_[0]->recv); 1 };
-
 					if($keep_alive && !$@){
 						$keep_alive->send(1);
 					}else {
-	                    shutdown $sock, 1;
-    	                close $sock;
-        	            $self->{exit_guard}->end;
+						shutdown $sock, 1;
+						close $sock;
+						$keep_alive && $keep_alive->send(0);
+						$self->{exit_guard}->end;
 						$cv->croak($@);
 					}
                 });
